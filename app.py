@@ -41,13 +41,14 @@ def settings_path() -> Path:
     return folder / "settings.json"
 
 
-def initial_values() -> tuple[dict[str, str], str]:
+def initial_values() -> tuple[dict[str, str], str, bool]:
     values = {key: DEFAULTS.get(key, "") for key in VALUE_KEYS}
     values["NP_API_KEY"] = ""
     for key, raw in load_env(ROOT / ".env").items():
         if key in values and raw.strip():
             values[key] = raw.strip()
     csv_path = ""
+    cod = True
     path = settings_path()
     if path.exists():
         saved = json.loads(path.read_text(encoding="utf-8"))
@@ -56,12 +57,15 @@ def initial_values() -> tuple[dict[str, str], str]:
             if raw:
                 values[key] = raw
         csv_path = str(saved.get("csv_path", "")).strip()
-    return values, csv_path
+        if isinstance(saved.get("cod"), bool):
+            cod = saved["cod"]
+    return values, csv_path, cod
 
 
-def save_settings(values: dict[str, str], csv_path: str) -> None:
+def save_settings(values: dict[str, str], csv_path: str, cod: bool) -> None:
     payload = {key: values.get(key, "").strip() for key in VALUE_KEYS}
     payload["csv_path"] = csv_path.strip()
+    payload["cod"] = cod
     settings_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -83,8 +87,9 @@ class App:
         self.events: queue.Queue[str | None] = queue.Queue()
         self.running = False
         self.fields: dict[str, tk.StringVar] = {}
-        values, csv_path = initial_values()
+        values, csv_path, cod = initial_values()
         self.csv_path = tk.StringVar(value=csv_path)
+        self.cod = tk.BooleanVar(value=cod)
         self._build(values)
         root.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -129,11 +134,18 @@ class App:
         ttk.Button(file_row, text="Обрати", command=self._choose_file).grid(row=0, column=2)
         buttons = ttk.Frame(file_row)
         buttons.grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.cod_check = ttk.Checkbutton(
+            buttons,
+            text="Післяплата",
+            variable=self.cod,
+            command=self._persist,
+        )
+        self.cod_check.pack(side="left", padx=(0, 12))
         self.test_button = ttk.Button(buttons, text="Test", width=16, command=lambda: self.start(True))
         self.test_button.pack(side="left")
         self.run_button = ttk.Button(buttons, text="Run", width=16, command=lambda: self.start(False))
         self.run_button.pack(side="left", padx=8)
-        ttk.Label(buttons, text="Test лише перевіряє. Run створює накладні.").pack(side="left", padx=8)
+        ttk.Label(buttons, text="Оцінка завжди дорівнює сумі. Test лише перевіряє.").pack(side="left", padx=8)
 
         log_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         log_frame.grid(row=2, column=0, sticky="nsew")
@@ -169,7 +181,7 @@ class App:
         return {key: self.fields[key].get() for key in VALUE_KEYS if key in self.fields}
 
     def _persist(self) -> None:
-        save_settings(self._values(), self.csv_path.get())
+        save_settings(self._values(), self.csv_path.get(), bool(self.cod.get()))
 
     def _append(self, text: str) -> None:
         self.log.configure(state="normal")
@@ -182,6 +194,7 @@ class App:
         state = "disabled" if busy else "normal"
         self.test_button.configure(state=state)
         self.run_button.configure(state=state)
+        self.cod_check.configure(state=state)
 
     def _close(self) -> None:
         if self.running:
@@ -202,9 +215,11 @@ class App:
         except ValueError as error:
             messagebox.showerror("Налаштування", str(error), parent=self.root)
             return
+        cod = bool(self.cod.get())
+        payment = "з післяплатою" if cod else "без післяплати"
         if not dry_run and not messagebox.askyesno(
             "Run",
-            "Створити справжні накладні з цього файлу?",
+            f"Створити справжні накладні з цього файлу ({payment})?",
             parent=self.root,
         ):
             return
@@ -214,20 +229,20 @@ class App:
         self._set_busy(True)
         worker = threading.Thread(
             target=self._run,
-            args=(dry_run, csv_path, self._values()),
+            args=(dry_run, csv_path, self._values(), cod),
             daemon=True,
         )
         worker.start()
         self.root.after(100, self._poll)
 
-    def _run(self, dry_run: bool, csv_path: str, values: dict[str, str]) -> None:
+    def _run(self, dry_run: bool, csv_path: str, values: dict[str, str], cod: bool) -> None:
         writer = QueueWriter(self.events)
         previous_out, previous_err = sys.stdout, sys.stderr
         sys.stdout = writer
         sys.stderr = writer
         try:
             api_key, config = config_from_values(values)
-            run_batch(Path(csv_path), api_key, config, dry_run, True)
+            run_batch(Path(csv_path), api_key, config, dry_run, True, cod)
         except (ValueError, SystemExit) as error:
             print(error_message(error))
         except Exception as error:

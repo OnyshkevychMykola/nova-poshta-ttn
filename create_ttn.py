@@ -8,9 +8,10 @@
   місто;відділення;піб;телефон;сума;відділення_відправника
 
 Відправник, опис і габарити малої посилки беруться з .env.
-Отримувач платить і доставку, і комісію грошового переказу. Оціночна вартість
-дорівнює сумі післяплати. Номер картки API не приймає: виплата йде так,
-як налаштовано в кабінеті.
+Оціночна вартість завжди дорівнює сумі. Післяплата вмикається за замовчуванням:
+отримувач платить доставку і комісію переказу. Номер картки API не приймає,
+виплата йде так, як налаштовано в кабінеті. Прапорець --no-cod прибирає лише
+післяплату.
 """
 
 from __future__ import annotations
@@ -379,6 +380,19 @@ def tracking_url(number: str) -> str:
     return f"https://novaposhta.ua/tracking/?cargo_number={number}"
 
 
+def payment_fields(amount: str, cod: bool) -> dict:
+    fields: dict = {"Cost": amount}
+    if cod:
+        fields["BackwardDeliveryData"] = [
+            {
+                "PayerType": "Recipient",
+                "CargoType": "Money",
+                "RedeliveryString": amount,
+            }
+        ]
+    return fields
+
+
 def resolve_route(api_key: str, shipment: dict[str, str], config: dict[str, str], cache: dict | None = None) -> dict:
     cache = cache if cache is not None else {}
     cities: dict[str, dict] = cache.setdefault("cities", {})
@@ -413,7 +427,7 @@ def resolve_route(api_key: str, shipment: dict[str, str], config: dict[str, str]
     }
 
 
-def preview(shipment: dict[str, str], route: dict, config: dict[str, str], existing: dict | None) -> None:
+def preview(shipment: dict[str, str], route: dict, config: dict[str, str], existing: dict | None, cod: bool = True) -> None:
     sender_phone = display_phone(route["contact"]["Phones"])
     recipient_name = shipment["name"]
     if existing and norm_name(existing.get("Description", "")) != norm_name(shipment["name"]):
@@ -426,15 +440,17 @@ def preview(shipment: dict[str, str], route: dict, config: dict[str, str], exist
     print(f"Звідки: {route['sender_warehouse'].get('Description')}")
     print(f"Отримувач: {recipient_name}, {display_phone(shipment['phone'])}")
     print(f"Куди: {route['recipient_warehouse'].get('Description')}")
-    print(f"Сума: {shipment['amount']} грн, оцінка і післяплата")
+    payment = "оцінка і післяплата" if cod else "оцінка без післяплати"
+    print(f"Сума: {shipment['amount']} грн, {payment}")
     print(
         f"Посилка: {config['description']}, {config['weight']} кг, "
         f"{config['length']}×{config['width']}×{config['height']} см"
     )
-    print("Платник доставки і комісії переказу: отримувач, готівка")
+    payer = "Платник доставки і комісії переказу" if cod else "Платник доставки"
+    print(f"{payer}: отримувач, готівка")
 
 
-def create_document(api_key: str, shipment: dict[str, str], route: dict, config: dict[str, str], recipient: dict, contact: dict) -> None:
+def create_document(api_key: str, shipment: dict[str, str], route: dict, config: dict[str, str], recipient: dict, contact: dict, cod: bool = True) -> None:
     props = {
         "PayerType": "Recipient",
         "PaymentMethod": "Cash",
@@ -445,7 +461,6 @@ def create_document(api_key: str, shipment: dict[str, str], route: dict, config:
         "ServiceType": "WarehouseWarehouse",
         "SeatsAmount": "1",
         "Description": config["description"],
-        "Cost": shipment["amount"],
         "CitySender": route["sender_city"]["DeliveryCity"],
         "Sender": route["counterparty"]["Ref"],
         "SenderAddress": route["sender_warehouse"]["Ref"],
@@ -465,14 +480,8 @@ def create_document(api_key: str, shipment: dict[str, str], route: dict, config:
                 "weight": config["weight"],
             }
         ],
-        "BackwardDeliveryData": [
-            {
-                "PayerType": "Recipient",
-                "CargoType": "Money",
-                "RedeliveryString": shipment["amount"],
-            }
-        ],
     }
+    props.update(payment_fields(shipment["amount"], cod))
     payload = call(api_key, "InternetDocumentGeneral", "save", props)
     print_warnings(payload)
     document = (payload.get("data") or [{}])[0]
@@ -531,6 +540,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--csv", help="CSV: місто; відділення; піб; телефон; сума")
     parser.add_argument("--yes", action="store_true", help="Створити без підтвердження")
     parser.add_argument("--dry-run", action="store_true", help="Перевірити адреси і не створювати ТТН")
+    parser.add_argument("--no-cod", action="store_true", help="Не додавати післяплату, оцінку залишити")
     parser.add_argument("--whoami", action="store_true", help="Показати відправника з кабінету")
     parser.add_argument("--self-test", action="store_true", help="Перевірити розбір рядка без API")
     return parser
@@ -654,7 +664,7 @@ def error_message(error: Exception) -> str:
     return str(error)
 
 
-def preview_row(line_no: int, shipment: dict[str, str], route: dict, existing: dict | None) -> None:
+def preview_row(line_no: int, shipment: dict[str, str], route: dict, existing: dict | None, cod: bool = True) -> None:
     name = shipment["name"]
     if existing and norm_name(existing.get("Description", "")) != norm_name(shipment["name"]):
         name += f" (у кабінеті: {existing.get('Description')})"
@@ -665,7 +675,8 @@ def preview_row(line_no: int, shipment: dict[str, str], route: dict, existing: d
     origin = ""
     if shipment["sender_warehouse"]:
         origin = f" | з {route['sender_warehouse'].get('Description')}"
-    print(f"#{line_no} {name}, {display_phone(shipment['phone'])}, {shipment['amount']} грн{origin}")
+    payment = "післяплата" if cod else "без післяплати"
+    print(f"#{line_no} {name}, {display_phone(shipment['phone'])}, {shipment['amount']} грн, {payment}{origin}")
     print(f"   {route['recipient_warehouse'].get('Description')}")
 
 
@@ -689,12 +700,13 @@ def write_results(path: Path, rows: list[tuple[int, dict[str, str], str, str]]) 
     return target
 
 
-def run_batch(path: Path, api_key: str, config: dict[str, str], dry_run: bool, skip_confirm: bool) -> Path | None:
+def run_batch(path: Path, api_key: str, config: dict[str, str], dry_run: bool, skip_confirm: bool, cod: bool = True) -> Path | None:
     shipments = load_shipments(path)
     print(
         f"Відправник: {config['sender_name']}, {config['sender_city']}, відділення {config['sender_warehouse']}"
     )
-    print(f"Посилка: {config['description']}, {config['weight']} кг. Рядків: {len(shipments)}")
+    payment = "з післяплатою" if cod else "без післяплати"
+    print(f"Посилка: {config['description']}, {config['weight']} кг. Рядків: {len(shipments)}. {payment}, оцінка = сума")
     cache: dict = {}
     ready: list[tuple[int, dict[str, str], dict, dict | None]] = []
     failed: list[tuple[int, dict[str, str], str, str]] = []
@@ -702,7 +714,7 @@ def run_batch(path: Path, api_key: str, config: dict[str, str], dry_run: bool, s
         try:
             route = resolve_route(api_key, shipment, config, cache)
             existing = find_recipient(api_key, shipment["phone"])
-            preview_row(line_no, shipment, route, existing)
+            preview_row(line_no, shipment, route, existing, cod)
             ready.append((line_no, shipment, route, existing))
         except (ValueError, SystemExit) as error:
             message = error_message(error)
@@ -727,7 +739,7 @@ def run_batch(path: Path, api_key: str, config: dict[str, str], dry_run: bool, s
             else:
                 recipient, contact = create_recipient(api_key, shipment)
                 created_contacts[shipment["phone"]] = (recipient, contact)
-            number = create_document(api_key, shipment, route, config, recipient, contact)
+            number = create_document(api_key, shipment, route, config, recipient, contact, cod)
             results.append((line_no, shipment, number, ""))
         except (ValueError, SystemExit) as error:
             message = error_message(error)
@@ -769,6 +781,10 @@ def self_test() -> None:
     assert len(table) == 2
     assert table[0][1]["phone"] == "380505530332"
     assert table[1][1]["amount"] == "1200" and table[1][1]["sender_warehouse"] == "12"
+    with_cod = payment_fields("1500", True)
+    assert with_cod["Cost"] == "1500"
+    assert with_cod["BackwardDeliveryData"][0]["RedeliveryString"] == "1500"
+    assert payment_fields("1500", False) == {"Cost": "1500"}
     assert normalize_phone("505530332") == "380505530332"
     try:
         parse_line("Одеса 23 Шкута Олег 0505530332")
@@ -790,9 +806,10 @@ def main() -> None:
         return
     if args.csv and args.line:
         raise SystemExit("Передайте або один рядок, або --csv")
+    cod = not args.no_cod
     if args.csv:
         api_key, config = load_config()
-        run_batch(Path(args.csv), api_key, config, args.dry_run, args.yes)
+        run_batch(Path(args.csv), api_key, config, args.dry_run, args.yes, cod)
         return
     if not args.line:
         if not sys.stdin.isatty():
@@ -803,7 +820,7 @@ def main() -> None:
     api_key, config = load_config()
     route = resolve_route(api_key, shipment, config)
     existing = find_recipient(api_key, shipment["phone"])
-    preview(shipment, route, config, existing)
+    preview(shipment, route, config, existing, cod)
     if args.dry_run:
         print("ТТН не створено")
         return
@@ -812,7 +829,7 @@ def main() -> None:
         recipient, contact = existing, recipient_contact(api_key, existing)
     else:
         recipient, contact = create_recipient(api_key, shipment)
-    create_document(api_key, shipment, route, config, recipient, contact)
+    create_document(api_key, shipment, route, config, recipient, contact, cod)
 
 
 if __name__ == "__main__":
